@@ -1,0 +1,21 @@
+[project]
+name = "vla-gnn-recurrent"
+version = "0.1.0"
+description = "Minimal closed-loop Synthetic Dynamic Graph -> Edge-aware GNN -> GRU controller prototype."
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "mujoco>=3.2",
+    "dm-control>=1.0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
