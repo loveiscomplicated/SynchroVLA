@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -479,6 +481,8 @@ class MujocoManipulatorEnv:
         output_dir = Path("artifacts/mujoco_prototype/generated_models")
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "manipulator_pick_scene.xml"
+        if path.exists() and path.stat().st_size > 0:
+            return path
         text = self.xml_path.read_text(encoding="utf-8")
         common_dir = (self.xml_path.parent / "common").resolve()
         text = text.replace('file="./common/', f'file="{common_dir}/')
@@ -492,7 +496,9 @@ class MujocoManipulatorEnv:
             'solref="0.004 1.0" solimp="0.92 0.98 0.001"/>\n'
         )
         text = text.replace("  <worldbody>\n", "  <worldbody>\n" + support_xml, 1)
-        path.write_text(text, encoding="utf-8")
+        tmp_path = output_dir / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(path)
         return path
 
     def _configure_actuators(self) -> None:

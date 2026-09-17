@@ -61,6 +61,18 @@ def test_physical_arm_control_does_not_teleport_to_ik_target() -> None:
     assert np.linalg.norm(after_q - start_q) > 0.0
 
 
+def test_pick_scene_xml_generation_recovers_from_empty_file() -> None:
+    env = MujocoManipulatorEnv(MujocoReachConfig(max_steps=4, pick_scene=True), seed=140)
+    path = env._pick_scene_xml_path()
+    path.write_text("", encoding="utf-8")
+
+    recovered = env._pick_scene_xml_path()
+
+    assert recovered == path
+    assert recovered.stat().st_size > 0
+    assert "<mujoco" in recovered.read_text(encoding="utf-8")
+
+
 def test_actuator_command_respects_control_ranges() -> None:
     env = MujocoManipulatorEnv(
         MujocoReachConfig(max_steps=4, control_substeps=3, max_delta_ee=0.2, motor_ctrl_limit=1.2),
