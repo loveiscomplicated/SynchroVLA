@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
         help="Additional policy checkpoint to include in offline precision tables. May be repeated.",
     )
     parser.add_argument("--split", default="test")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--max-step", type=float, default=0.045)
     parser.add_argument("--saturation-fraction", type=float, default=0.90)
     parser.add_argument("--failure-seed", type=int, default=4242)

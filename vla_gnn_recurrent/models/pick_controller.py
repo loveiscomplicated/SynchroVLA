@@ -107,6 +107,108 @@ class PickFeedForwardController(nn.Module):
             nn.init.zeros_(final.bias)
 
 
+class FlatPickFeedForwardController(nn.Module):
+    """Flat state -> MLP -> [Delta x, Delta z, gripper]."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 128,
+        action_hidden_dim: int = 128,
+        max_step: float = 0.045,
+        action_head_type: PickActionHeadType = "direction_magnitude",
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.max_step = float(max_step)
+        self.action_head_type = action_head_type
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.action_head = nn.Sequential(
+            nn.Linear(hidden_dim, action_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(action_hidden_dim, _raw_action_dim(action_head_type)),
+        )
+        self._init_action_head()
+
+    def raw_action(self, state: torch.Tensor) -> torch.Tensor:
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        return self.action_head(self.encoder(state)).squeeze(0)
+
+    def forward(self, state: torch.Tensor) -> PickAction:
+        return decode_pick_action(self.raw_action(state), self.max_step, self.action_head_type)
+
+    def _init_action_head(self) -> None:
+        final = self.action_head[-1]
+        if isinstance(final, nn.Linear):
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+
+
+class FlatPickRecurrentController(nn.Module):
+    """Flat state_t -> MLP encoder -> 2-layer GRU -> [Delta x, Delta z, gripper]."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        encoder_hidden_dim: int = 128,
+        gru_hidden_dim: int = 256,
+        gru_layers: int = 2,
+        action_hidden_dim: int = 128,
+        max_step: float = 0.045,
+        action_head_type: PickActionHeadType = "direction_magnitude",
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.max_step = float(max_step)
+        self.action_head_type = action_head_type
+        self.gru_hidden_dim = gru_hidden_dim
+        self.gru_layers = gru_layers
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim, encoder_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(encoder_hidden_dim, encoder_hidden_dim),
+            nn.SiLU(),
+        )
+        self.gru = nn.GRU(
+            input_size=encoder_hidden_dim,
+            hidden_size=gru_hidden_dim,
+            num_layers=gru_layers,
+            batch_first=True,
+        )
+        self.action_head = nn.Sequential(
+            nn.Linear(gru_hidden_dim, action_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(action_hidden_dim, _raw_action_dim(action_head_type)),
+        )
+        self._init_action_head()
+
+    def initial_hidden(self, device: torch.device | str) -> torch.Tensor:
+        return torch.zeros(self.gru_layers, 1, self.gru_hidden_dim, device=device)
+
+    def raw_action(self, state: torch.Tensor, hidden: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        embedding = self.encoder(state).unsqueeze(1)  # [1, 1, 128]
+        output, next_hidden = self.gru(embedding, hidden)
+        return self.action_head(output[:, -1, :]).squeeze(0), next_hidden
+
+    def forward(self, state: torch.Tensor, hidden: torch.Tensor | None = None) -> tuple[PickAction, torch.Tensor]:
+        raw, next_hidden = self.raw_action(state, hidden)
+        return decode_pick_action(raw, self.max_step, self.action_head_type), next_hidden
+
+    def _init_action_head(self) -> None:
+        final = self.action_head[-1]
+        if isinstance(final, nn.Linear):
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+
+
 def decode_pick_action(
     raw_action: torch.Tensor,
     max_step: float,

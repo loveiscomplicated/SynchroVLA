@@ -13,7 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=48)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--output-dir", default="artifacts/mujoco_prototype/checkpoints")
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--bptt-steps", type=int, default=8)

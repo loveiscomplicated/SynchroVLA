@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 
-DevicePreference = Literal["auto", "cpu", "mps"]
+DevicePreference = Literal["auto", "cpu", "mps", "cuda"]
 
 
 def set_seed(seed: int) -> None:
@@ -16,6 +16,8 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
     torch.use_deterministic_algorithms(False)
@@ -28,6 +30,12 @@ def select_device(preference: DevicePreference = "auto") -> torch.device:
         if not torch.backends.mps.is_available():
             raise RuntimeError("MPS was requested but is not available in this PyTorch build.")
         return torch.device("mps")
+    if preference == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available in this PyTorch build.")
+        return torch.device("cuda")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -51,4 +59,3 @@ def clamp_delta(delta: torch.Tensor, max_step: float) -> torch.Tensor:
     norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = torch.clamp(max_step / norm, max=1.0)
     return delta * scale
-

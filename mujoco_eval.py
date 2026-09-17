@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=48)
     parser.add_argument("--seed", type=int, default=101)
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--observation-intervals", default="1")
     parser.add_argument("--moving-target", action="store_true")
     parser.add_argument("--perturb", action="store_true")

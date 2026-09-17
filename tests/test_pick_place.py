@@ -3,13 +3,19 @@ import torch
 from vla_gnn_recurrent.graph.manipulation_graph_builder import ManipulationGraphBuilder
 from vla_gnn_recurrent.sim.mujoco_env import MujocoManipulatorEnv, MujocoReachConfig
 from vla_gnn_recurrent.training.pick_place_bc import (
+    PlacementMetricConfig,
     PickPlaceDemoConfig,
     PickPlaceExpertConfig,
+    classify_placement_failure_source,
     classify_pick_place_failure,
+    aggregate_pick_place_alignment_dagger,
     generate_pick_place_demonstrations,
     load_pick_policy,
+    pick_place_precision_weight,
+    placement_diagnostics,
     run_closed_loop_pick_place_episode,
     run_scripted_pick_place_episode,
+    summarize_pick_place_results,
 )
 from vla_gnn_recurrent.training.pick_bc import load_pick_dataset
 from vla_gnn_recurrent.models.pick_controller import PickFeedForwardController
@@ -111,3 +117,85 @@ def test_closed_loop_pick_place_evaluation_does_not_call_expert(monkeypatch) -> 
 
     assert "records" in result
     assert len(result["records"]) <= 4
+
+
+def test_valid_release_metric_requires_prior_success() -> None:
+    fake = {
+        "approach_success": True,
+        "alignment_success": True,
+        "grasp_success": False,
+        "lift_success": False,
+        "transport_success": False,
+        "release_success": False,
+        "valid_release_success": False,
+        "gripper_open_event": True,
+        "placement_success": False,
+        "drop": False,
+        "steps": 3,
+        "first_grasp_step": None,
+        "first_release_step": None,
+        "gripper_open_step": 2,
+        "placement_step": None,
+        "mean_latency_ms": 0.0,
+        "failure_reason": "failed grasp",
+        "records": [{"step": 2, "placement_error": 0.2}],
+    }
+    summary = summarize_pick_place_results([fake])
+
+    assert summary["gripper_open_rate"] == 1.0
+    assert summary["valid_release_rate"] == 0.0
+    assert summary["release_success_rate"] == 0.0
+
+
+def test_destination_alignment_metrics_use_release_timestep() -> None:
+    episode = {
+        "placement_success": False,
+        "valid_release_success": True,
+        "valid_release_step": 5,
+        "records": [
+            {"step": 4, "placement_error": 0.05, "object_velocity_norm": 0.02},
+            {
+                "step": 5,
+                "pre_placement_error": 0.031,
+                "placement_error": 0.034,
+                "pre_object_velocity_norm": 0.09,
+            },
+            {"step": 6, "placement_error": 0.060, "object_velocity_norm": 0.01},
+        ],
+    }
+    metrics = placement_diagnostics(episode, PlacementMetricConfig(alignment_threshold=0.025))
+
+    assert metrics["pre_release_placement_error"] == 0.031
+    assert metrics["pre_release_object_velocity_norm"] == 0.09
+    assert abs(float(metrics["settle_drift"]) - 0.029) < 1e-8
+    assert not metrics["destination_alignment_success"]
+
+
+def test_placement_failure_source_categories() -> None:
+    base = {"placement_success": False, "valid_release_success": True}
+    thresholds = PlacementMetricConfig(placement_threshold=0.04, alignment_threshold=0.025, high_velocity_threshold=0.08)
+
+    assert (
+        classify_placement_failure_source(dict(base), 0.08, 0.01, thresholds)
+        == "pre_release_alignment_failure"
+    )
+    assert classify_placement_failure_source(dict(base), 0.03, 0.01, thresholds) == "premature_release"
+    assert classify_placement_failure_source(dict(base), 0.02, 0.12, thresholds) == "high_velocity_release"
+    assert classify_placement_failure_source(dict(base), 0.02, 0.01, thresholds) == "post_release_dynamics_failure"
+
+
+def test_pick_place_precision_weight_uses_destination_geometry() -> None:
+    env = MujocoManipulatorEnv(MujocoReachConfig(max_steps=8, control_substeps=5, pick_scene=True), seed=85)
+    obs = env.reset_pick_place_scene(object_x=-0.003, destination_x=-0.056, randomize_robot=False)
+    graph = ManipulationGraphBuilder(task="pick_and_place", include_object=True).build(obs)
+    weight = pick_place_precision_weight(graph, near_distance=0.05, medium_distance=0.10, near_weight=4.0, medium_weight=2.0)
+
+    assert float(weight.item()) in {1.0, 2.0, 4.0}
+    assert "phase_labels_diagnostics_only" not in graph.node_names
+
+
+def test_alignment_dagger_config_is_label_only() -> None:
+    source = aggregate_pick_place_alignment_dagger.__doc__ or ""
+
+    assert "never executed" in source
+    assert "expert only supplies supervised targets" in source

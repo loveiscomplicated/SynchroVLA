@@ -20,6 +20,8 @@ from torch import nn
 from vla_gnn_recurrent.graph.manipulation_graph_builder import ManipulationGraphBuilder
 from vla_gnn_recurrent.graph.types import GraphData
 from vla_gnn_recurrent.models.pick_controller import (
+    FlatPickFeedForwardController,
+    FlatPickRecurrentController,
     PickAction,
     PickFeedForwardController,
     PickRecurrentController,
@@ -30,7 +32,14 @@ from vla_gnn_recurrent.sim.mujoco_env import MujocoManipulatorEnv, MujocoReachCo
 from vla_gnn_recurrent.sim.pick_expert import ScriptedPickConfig
 from vla_gnn_recurrent.utils import DevicePreference, clamp_delta, ensure_dir, select_device, set_seed
 
-PickModelKind = Literal["graph_recurrent", "graph_feedforward", "graph_recurrent_dir_mag", "graph_feedforward_dir_mag"]
+PickModelKind = Literal[
+    "graph_recurrent",
+    "graph_feedforward",
+    "graph_recurrent_dir_mag",
+    "graph_feedforward_dir_mag",
+    "flat_recurrent_dir_mag",
+    "flat_feedforward_dir_mag",
+]
 RecurrentEvalMode = Literal["normal", "step_reset"]
 
 
@@ -660,7 +669,11 @@ def load_pick_dataset(path: str | Path) -> dict[str, Any]:
 def load_pick_policy(path: str | Path, device: torch.device) -> tuple[nn.Module, dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     max_step = float(checkpoint.get("env_config", {}).get("max_delta_ee", 0.045))
-    model = _build_pick_model(checkpoint["model_kind"], max_step=max_step).to(device)
+    model = _build_pick_model(
+        checkpoint["model_kind"],
+        max_step=max_step,
+        flat_input_dim=checkpoint.get("flat_input_dim"),
+    ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, checkpoint
@@ -1128,7 +1141,7 @@ def _episode_split(num_episodes: int, seed: int) -> dict[str, list[int]]:
     }
 
 
-def _build_pick_model(model_kind: PickModelKind, max_step: float) -> nn.Module:
+def _build_pick_model(model_kind: PickModelKind, max_step: float, flat_input_dim: int | None = None) -> nn.Module:
     if model_kind == "graph_recurrent":
         return PickRecurrentController(max_step=max_step)
     if model_kind == "graph_feedforward":
@@ -1137,6 +1150,22 @@ def _build_pick_model(model_kind: PickModelKind, max_step: float) -> nn.Module:
         return PickRecurrentController(max_step=max_step, action_head_type="direction_magnitude")
     if model_kind == "graph_feedforward_dir_mag":
         return PickFeedForwardController(max_step=max_step, action_head_type="direction_magnitude")
+    if model_kind == "flat_recurrent_dir_mag":
+        if flat_input_dim is None:
+            raise ValueError("flat_input_dim is required for flat_recurrent_dir_mag")
+        return FlatPickRecurrentController(
+            input_dim=flat_input_dim,
+            max_step=max_step,
+            action_head_type="direction_magnitude",
+        )
+    if model_kind == "flat_feedforward_dir_mag":
+        if flat_input_dim is None:
+            raise ValueError("flat_input_dim is required for flat_feedforward_dir_mag")
+        return FlatPickFeedForwardController(
+            input_dim=flat_input_dim,
+            max_step=max_step,
+            action_head_type="direction_magnitude",
+        )
     raise ValueError(f"Unknown pick model kind: {model_kind}")
 
 

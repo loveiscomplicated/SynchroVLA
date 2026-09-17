@@ -7,11 +7,18 @@ from vla_gnn_recurrent.training.pick_place_bc import PickPlaceTrainConfig, train
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Graph-GNN policies for MuJoCo Pick-and-Place.")
+    parser = argparse.ArgumentParser(description="Train static 2x2 MuJoCo Pick-and-Place policies.")
     parser.add_argument("--dataset-path", default="artifacts/mujoco_pick_place/demos/pick_place_demos.pt")
     parser.add_argument(
         "--model-kind",
-        choices=["graph_recurrent_dir_mag", "graph_feedforward_dir_mag", "graph_recurrent", "graph_feedforward"],
+        choices=[
+            "flat_feedforward_dir_mag",
+            "flat_recurrent_dir_mag",
+            "graph_feedforward_dir_mag",
+            "graph_recurrent_dir_mag",
+            "graph_recurrent",
+            "graph_feedforward",
+        ],
         default="graph_recurrent_dir_mag",
     )
     parser.add_argument("--output-dir", default="artifacts/mujoco_pick_place/checkpoints")
@@ -23,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--magnitude-loss-weight", type=float, default=1.0)
     parser.add_argument("--gripper-loss-weight", type=float, default=1.0)
     parser.add_argument("--no-precision-weighting", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--seed", type=int, default=321)
     parser.add_argument("--initial-checkpoint-path", default=None)
     return parser.parse_args()

@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="artifacts/mujoco_pick_place/workspace_robustness")
     parser.add_argument("--ff-checkpoint-path", default="artifacts/mujoco_pick_precision/checkpoints_ff_dir_mag/graph_feedforward_dir_mag.pt")
     parser.add_argument("--gru-checkpoint-path", default="artifacts/mujoco_pick_precision/checkpoints_gru_dir_mag_precision/graph_recurrent_dir_mag.pt")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--max-steps", type=int, default=180)
     parser.add_argument("--range", action="append", default=[], metavar="NAME:LOW:HIGH")
     parser.add_argument("--render", action="store_true")

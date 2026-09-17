@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=36)
     parser.add_argument("--seed", type=int, default=101)
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--perturb", action="store_true")
     parser.add_argument("--perturb-step", type=int, default=10)
     parser.add_argument("--output-dir", default="artifacts/eval")

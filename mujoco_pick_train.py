@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--magnitude-loss-weight", type=float, default=1.0)
     parser.add_argument("--gripper-loss-weight", type=float, default=1.0)
     parser.add_argument("--precision-weighting", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--initial-checkpoint-path", default=None)
     return parser.parse_args()

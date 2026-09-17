@@ -4,3 +4,4 @@ matplotlib>=3.8
 mujoco>=3.2
 dm-control>=1.0.34
 pytest>=8.0
+tqdm>=4.66

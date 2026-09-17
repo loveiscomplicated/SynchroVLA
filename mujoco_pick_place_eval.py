@@ -13,7 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=992)
     parser.add_argument("--output-dir", default="artifacts/mujoco_pick_place/eval")
     parser.add_argument("--recurrent-mode", choices=["normal", "step_reset"], default="normal")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--max-steps", type=int, default=340)
     parser.add_argument("--object-x-range", nargs=2, type=float, default=(-0.0048, -0.0001))
     parser.add_argument("--destination-x-range", nargs=2, type=float, default=(-0.060, -0.053))
