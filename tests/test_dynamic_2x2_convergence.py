@@ -60,3 +60,14 @@ def test_dynamic_convergence_cli_exposes_dataset_generation_cuda_and_parallel_ev
     assert '"cuda"' in source
     assert "--eval-workers" in source
     assert "--generate-dataset-if-missing" in source
+
+
+def test_dynamic_gpu_seed_launcher_creates_log_directory_before_redirection() -> None:
+    shell_source = Path("scripts/run_dynamic_2x2_gpu_seed.sh").read_text(encoding="utf-8")
+    python_source = Path("scripts/run_dynamic_2x2_gpu_seed.py").read_text(encoding="utf-8")
+
+    assert "mkdir -p \"${OUTPUT_ROOT}/logs\"" in shell_source
+    assert "scripts/run_dynamic_2x2_gpu_seed.py" in shell_source
+    assert "tqdm" in python_source
+    assert "CUDA_VISIBLE_DEVICES" in python_source
+    assert "\"run-one\"" in python_source
