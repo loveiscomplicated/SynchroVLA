@@ -203,6 +203,15 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local OS/editor files
+.DS_Store
+
+# MuJoCo/runtime artifacts
+MUJOCO_LOG.TXT
+artifacts/
+outputs/
+runs/
+
 # Ruff stuff:
 .ruff_cache/
 
