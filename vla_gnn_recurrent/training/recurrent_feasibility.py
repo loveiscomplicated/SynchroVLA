@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from collections import defaultdict
@@ -19,11 +20,12 @@ import torch
 from torch import nn
 
 from vla_gnn_recurrent.training import surface_graph_feasibility as sf
+from vla_gnn_recurrent.training import surface_pregrasp_stabilization as stab
 from vla_gnn_recurrent.training import surface_representation_final_comparison as final
 from vla_gnn_recurrent.utils import DevicePreference, clamp_delta, ensure_dir, select_device, set_seed
 
 
-ROOT = Path("artifacts/recurrent_feasibility")
+ROOT = Path("artifacts/recurrent_feasibility_canonical100")
 PRIOR = Path("artifacts/surface_representation_final_comparison")
 SEEDS = (2811, 2812, 2813)
 GRAPH_NAME = "surface_graph_no_local"
@@ -95,8 +97,18 @@ def _episodes(data: dict[str, Any]) -> list[dict[str, torch.Tensor]]:
 
 def sample_sequence_batch(episodes: list[dict[str, torch.Tensor]], count: int, max_length: int,
                           generator: np.random.Generator, device: torch.device,
-                          lengths_out: list[int] | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    picks = generator.integers(len(episodes), size=count)
+                          lengths_out: list[int] | None = None,
+                          episode_weights: np.ndarray | None = None,
+                          picks_out: list[int] | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if episode_weights is None:
+        picks = generator.integers(len(episodes), size=count)
+    else:
+        weights = np.asarray(episode_weights, dtype=np.float64)
+        if weights.shape != (len(episodes),) or np.any(weights < 0) or not np.isclose(weights.sum(), 1):
+            raise ValueError("Episode sampling weights must be a nonnegative probability vector.")
+        picks = generator.choice(len(episodes), size=count, p=weights)
+    if picks_out is not None:
+        picks_out.extend(int(pick) for pick in picks)
     slices: list[dict[str, torch.Tensor]] = []
     for pick in picks:
         episode = episodes[int(pick)]
@@ -135,27 +147,39 @@ def mixed_sequence_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Te
 def train_gru(model: GraphGRUPolicy, expert: dict[str, Any], validation: dict[str, Any],
               policy: dict[str, Any] | None, config: sf.SurfaceFeasibilityConfig,
               temporal: TemporalConfig, seed: int, device: torch.device, updates: int,
-              output: Path) -> dict[str, Any]:
+              output: Path, *, sampling_seed: int | None = None,
+              validation_interval: int | None = None, stage_label: str | None = None,
+              policy_episode_weights: np.ndarray | None = None,
+              separate_source_rngs: bool = False) -> dict[str, Any]:
     model.train()
     expert_episodes = _episodes(expert)
     policy_episodes = _episodes(policy) if policy is not None else []
     val_episodes = _episodes(validation)
-    rng = np.random.default_rng(seed + (700_001 if policy is not None else 300_001))
+    effective_sampling_seed = (seed + (700_001 if policy is not None else 300_001)
+                               if sampling_seed is None else sampling_seed)
+    rng = np.random.default_rng(effective_sampling_seed)
+    policy_rng = np.random.default_rng(effective_sampling_seed + 1) if separate_source_rngs else rng
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     best_val = float("inf")
     history = []
-    validation_interval = 25 if policy_episodes else 20
+    validation_interval = validation_interval or (25 if policy_episodes else 20)
+    effective_stage = stage_label or ("dagger" if policy is not None else "base")
     exposure = {"expert_valid_supervised_timesteps": 0, "policy_valid_supervised_timesteps": 0,
                 "expert_sampled_sequence_lengths": [], "policy_sampled_sequence_lengths": []}
+    sampled_policy_indices: list[int] = []
+    sampled_expert_indices: list[int] = []
     checkpoint = ensure_dir(output) / "gru.pt"
     for update in range(1, updates + 1):
         expert_count = temporal.sequence_batch_size if not policy_episodes else temporal.sequence_batch_size // 2
         batches = [sample_sequence_batch(expert_episodes, expert_count, temporal.sequence_length, rng, device,
-                                         exposure["expert_sampled_sequence_lengths"])]
+                                         exposure["expert_sampled_sequence_lengths"],
+                                         picks_out=sampled_expert_indices)]
         if policy_episodes:
             batches.append(sample_sequence_batch(policy_episodes, temporal.sequence_batch_size - expert_count,
-                                                 temporal.sequence_length, rng, device,
-                                                 exposure["policy_sampled_sequence_lengths"]))
+                                                 temporal.sequence_length, policy_rng, device,
+                                                 exposure["policy_sampled_sequence_lengths"],
+                                                 episode_weights=policy_episode_weights,
+                                                 picks_out=sampled_policy_indices))
         if len(batches) > 1 and batches[0][0].shape[1] != batches[-1][0].shape[1]:
             width = max(b[0].shape[1] for b in batches)
             batches = [tuple(torch.cat([x, x.new_zeros((x.shape[0], width - x.shape[1], *x.shape[2:]))], 1) if x.shape[1] < width else x
@@ -196,7 +220,9 @@ def train_gru(model: GraphGRUPolicy, expert: dict[str, Any], validation: dict[st
                 best_val = value
                 torch.save({"model_state": model.state_dict(), "seed": seed, "updates": update,
                             "best_validation_loss": value, "hidden_size": temporal.gru_hidden,
-                            "stage": "dagger" if policy is not None else "base"}, checkpoint)
+                            "topology": "consistent_intended_100" if config.symmetric_robot_edges else "legacy_98_train_100_rollout",
+                            "config": asdict(config),
+                            "stage": effective_stage}, checkpoint)
             model.train()
     def length_distribution(lengths: list[int]) -> dict[str, Any]:
         counts = {str(length): lengths.count(length) for length in sorted(set(lengths))}
@@ -205,7 +231,10 @@ def train_gru(model: GraphGRUPolicy, expert: dict[str, Any], validation: dict[st
                 "p50": float(np.percentile(lengths, 50)) if lengths else None,
                 "p95": float(np.percentile(lengths, 95)) if lengths else None}
 
+    selected = torch.load(checkpoint, map_location="cpu", weights_only=False)
     result = {"checkpoint": str(checkpoint), "updates": updates, "best_validation_loss": best_val,
+              "selected_update": int(selected["updates"]), "final_update_loss": history[-1]["train_loss"],
+              "stage": effective_stage,
               "expert_sequences": len(expert_episodes), "policy_sequences": len(policy_episodes),
               "expert_policy_sequence_fraction": [1.0, 0.0] if policy is None else [0.5, 0.5],
               "sequence_batch_size": temporal.sequence_batch_size, "sequence_length": temporal.sequence_length,
@@ -216,7 +245,12 @@ def train_gru(model: GraphGRUPolicy, expert: dict[str, Any], validation: dict[st
               "actual_valid_supervised_timesteps": exposure["expert_valid_supervised_timesteps"] + exposure["policy_valid_supervised_timesteps"],
               "sampled_expert_sequence_lengths": length_distribution(exposure["expert_sampled_sequence_lengths"]),
               "sampled_policy_sequence_lengths": length_distribution(exposure["policy_sampled_sequence_lengths"]),
-              "initialization_seed": seed, "sampling_seed": seed + (700_001 if policy is not None else 300_001),
+              "sampled_policy_episode_index_counts": {
+                  str(index): sampled_policy_indices.count(index) for index in sorted(set(sampled_policy_indices))},
+              "sampled_expert_episode_index_sha256": hashlib.sha256(
+                  np.asarray(sampled_expert_indices, dtype=np.int64).tobytes()).hexdigest(),
+              "separate_source_rngs": separate_source_rngs,
+              "initialization_seed": seed, "sampling_seed": effective_sampling_seed,
               "hidden_initialization": "zero at each sampled contiguous segment; full episode at evaluation",
               "history": history}
     sf._write_json(output / "training.json", result)
@@ -251,7 +285,19 @@ def _graph_tensors(state: np.ndarray, points: np.ndarray, config: sf.SurfaceFeas
     points_t = torch.as_tensor(points, dtype=torch.float32, device=device).reshape(1, -1, 3)
     topology_np = sf.build_graph_topology_numpy(points, state[8:14].reshape(2, 3), config, False)
     topology = sf.topology_from_numpy(topology_np, device)
+    if config.symmetric_robot_edges:
+        assert_canonical_topology(topology, config)
     return state_t, points_t, topology
+
+
+def assert_canonical_topology(topology: sf.GraphTopology, config: sf.SurfaceFeasibilityConfig) -> None:
+    if config.point_count != 32 or topology.src.shape[1] != 100:
+        raise AssertionError("Canonical no-local graph requires N=32 and exactly 100 directed edges.")
+    edges = set(zip(topology.src[0].detach().cpu().tolist(), topology.dst[0].detach().cpu().tolist(), strict=True))
+    if not {(0, 1), (1, 0), (0, 2), (2, 0)}.issubset(edges):
+        raise AssertionError("Canonical graph requires symmetric EE-fingertip edges.")
+    if torch.any(topology.edge_type == 3):
+        raise AssertionError("Canonical no-local graph must not contain surface-surface edges.")
 
 
 def clipped_action(raw: np.ndarray, config: sf.SurfaceFeasibilityConfig) -> np.ndarray:
@@ -285,23 +331,45 @@ def parameter_audit(model: nn.Module, config: sf.SurfaceFeasibilityConfig) -> di
 @torch.no_grad()
 def controller_step(model: nn.Module, controller: str, state: np.ndarray, points: np.ndarray,
                     hidden: torch.Tensor | None, config: sf.SurfaceFeasibilityConfig,
-                    device: torch.device) -> tuple[np.ndarray, torch.Tensor | None]:
+                    device: torch.device, diagnostics: dict[str, Any] | None = None) -> tuple[np.ndarray, torch.Tensor | None]:
     state_t, points_t, topology = _graph_tensors(state, points, config, device)
     if controller == "gru":
         assert isinstance(model, GraphGRUPolicy)
+        previous = hidden if hidden is not None else state_t.new_zeros((1, 1, model.hidden_size))
         raw, hidden = model.step(state_t, points_t, hidden, topology)
+        if diagnostics is not None:
+            diagnostics["hidden_delta_norm"] = float((hidden - previous).norm().detach().cpu())
     elif controller == "ff":
         raw = model(state_t, points_t, topology)
         hidden = None
     else:
         raise ValueError(controller)
-    return clipped_action(raw[0].detach().cpu().numpy(), config), hidden
+    raw_numpy = raw[0].detach().cpu().numpy()
+    if diagnostics is not None:
+        diagnostics["raw_predicted_action"] = raw_numpy.tolist()
+    return clipped_action(raw_numpy, config), hidden
+
+
+def hidden_reset_due(policy: str, timestep: int) -> bool:
+    if policy == "normal":
+        return timestep == 0
+    if not policy.startswith("reset_"):
+        raise ValueError(f"Unknown hidden-state policy: {policy}")
+    interval = int(policy.removeprefix("reset_"))
+    if interval < 1:
+        raise ValueError("Hidden reset interval must be positive.")
+    return timestep % interval == 0
 
 
 def rollout(env: sf.SurfaceManipulatorEnv, spec: sf.SurfaceEpisodeSpec, model: nn.Module,
             controller: str, config: sf.SurfaceFeasibilityConfig, temporal: TemporalConfig,
             device: torch.device, mode: str = "fresh", severity: int = 0,
-            collect: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            collect: bool = False, hidden_policy: str = "normal",
+            record_dynamics: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if controller == "gru":
+        hidden_reset_due(hidden_policy, 0)
+    elif hidden_policy != "normal":
+        raise ValueError("Hidden reset policies require a GRU controller.")
     sf._reset_surface_env(env, spec)
     shape = spec.shape
     initial = env.robot_observation().ee_position.numpy().astype(np.float64)
@@ -342,21 +410,30 @@ def rollout(env: sf.SurfaceManipulatorEnv, spec: sf.SurfaceEpisodeSpec, model: n
             first_collision = step
         errors = sf._state_errors(env, shape, config, target)
         oracle = sf.expert_action(env, shape, config)[0] if collect else None
-        action, hidden = controller_step(model, controller, observed_state, observed_points, hidden, config, device)
+        reset_hidden = controller == "gru" and hidden_reset_due(hidden_policy, step)
+        if reset_hidden:
+            hidden = None
+        action_diagnostics: dict[str, Any] = {}
+        action, hidden = controller_step(model, controller, observed_state, observed_points, hidden,
+                                         config, device, diagnostics=action_diagnostics)
         severe = clearance < temporal.severe_penetration_m
         trace.append({
             "episode_id": spec.episode_id, "t": step,
             "true_ee_pose": env.robot_observation().ee_position.numpy().tolist(),
             "true_yaw": float(sf.tool_yaw(env)), "true_aperture": float(sf.gripper_width(env)),
             "observed_graph_timestamp": step - age, "observation_age": age,
-            "observed_state": observed_state.tolist() if collect else None,
-            "observed_surface_points": observed_points.tolist() if collect else None,
-            "true_state": state.tolist() if collect else None,
-            "true_surface_points": points.tolist() if collect else None,
+            "observed_state": observed_state.tolist() if collect or record_dynamics else None,
+            "observed_surface_points": observed_points.tolist() if collect or record_dynamics else None,
+            "true_state": state.tolist() if collect or record_dynamics else None,
+            "true_surface_points": points.tolist() if collect or record_dynamics else None,
             "target_pose": target[0].tolist(), "target_yaw": float(target[2]),
             "position_error": errors["position_error"], "orientation_error": errors["orientation_error"],
             "aperture_error": errors["gripper_width_error"],
             "predicted_action": action.tolist(), "oracle_action": oracle.tolist() if oracle is not None else None,
+            "raw_predicted_action": action_diagnostics["raw_predicted_action"],
+            "processed_action": action.tolist(), "hidden_policy": hidden_policy,
+            "hidden_reset": reset_hidden,
+            "hidden_delta_norm": action_diagnostics.get("hidden_delta_norm"),
             "collision": collision_now, "clearance_m": float(clearance),
             "severe_penetration_excluded": bool(severe),
             "success_state": sf._success_from_errors(errors, seen_collision, config),
@@ -364,6 +441,11 @@ def rollout(env: sf.SurfaceManipulatorEnv, spec: sf.SurfaceEpisodeSpec, model: n
             "hidden_norm": float(hidden.norm().detach().cpu()) if hidden is not None else None,
         })
         sf.apply_local_action(env, action, config)
+        if record_dynamics:
+            next_state, next_points, _ = sf.observation_inputs(
+                env, shape, config.point_count, sf._stable_seed(spec.sample_identity))
+            trace[-1]["next_true_state"] = next_state.tolist()
+            trace[-1]["next_true_surface_points"] = next_points.tolist()
         current = env.robot_observation().ee_position.numpy().astype(np.float64)
         trajectory.append(current.tolist())
         after_contacts, after_clearance = sf._surface_distance_metrics(env, shape)
@@ -462,6 +544,9 @@ def collect_recurrent_policy_data(model: GraphGRUPolicy, specs: list[sf.SurfaceE
 def _load_gru(path: Path, config: sf.SurfaceFeasibilityConfig,
               temporal: TemporalConfig, device: torch.device) -> GraphGRUPolicy:
     payload = torch.load(path, map_location=device, weights_only=False)
+    expected = "consistent_intended_100" if config.symmetric_robot_edges else "legacy_98_train_100_rollout"
+    if payload.get("topology") != expected:
+        raise ValueError(f"GRU checkpoint topology mismatch: {path}")
     model = GraphGRUPolicy(config, temporal.gru_hidden).to(device)
     model.load_state_dict(payload["model_state"])
     return model.eval()
@@ -573,15 +658,42 @@ def _task_config(output: Path, seeds: tuple[int, ...], device: DevicePreference,
     tuple_fields = ("seeds", "training_object_x_range", "training_object_z_range", "training_length_range",
                     "training_half_width_range", "training_depth_range", "ood_half_width_range", "ood_depth_range")
     values = {k: tuple(v) if k in tuple_fields else v for k, v in fields.items()}
-    values.update(output_dir=str(output), device=device, eval_device=eval_device, point_count=32)
+    values.update(output_dir=str(output), device=device, eval_device=eval_device, point_count=32,
+                  symmetric_robot_edges=True)
     return sf.SurfaceFeasibilityConfig(**values)
+
+
+def _restrict_episodes(data: dict[str, Any], specs: list[sf.SurfaceEpisodeSpec]) -> dict[str, Any]:
+    """Select complete physical episodes for smoke runs, preserving timestep order."""
+    selected = {spec.episode_id for spec in specs}
+    keep = torch.as_tensor([int(x) in selected for x in data["episode_ids"].tolist()], dtype=torch.bool)
+    size = len(data["episode_ids"])
+    result = {key: (value[keep] if isinstance(value, torch.Tensor) and len(value.shape) > 0
+                    and value.shape[0] == size else value) for key, value in data.items()}
+    result["specs"] = [asdict(spec) for spec in specs]
+    if "episodes" in result:
+        result["episodes"] = [row for row in result["episodes"] if row["spec"]["episode_id"] in selected]
+    return result
+
+
+def _expert_reference(seed: int, specs: list[sf.SurfaceEpisodeSpec]) -> dict[int, dict[str, Any]]:
+    path = PRIOR / "onpolicy_collection" / f"seed{seed}" / "expert_reference" / "expert_states.pt"
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    recorded = {int(row["spec"]["episode_id"]): row for row in data["episodes"]}
+    if not {spec.episode_id for spec in specs}.issubset(recorded):
+        raise ValueError("Missing historical expert reference for canonical physical training specs.")
+    return {spec.episode_id: {"ee_positions": recorded[spec.episode_id]["expert_rollout"]["trajectory"]}
+            for spec in specs}
 
 
 def _plot_condition_curves(aggregate: dict[str, Any], output: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     for mode in ("stale", "delay"):
-        entries = aggregate["pooled"][mode]
+        entries = aggregate["pooled"].get(mode, {})
         x = sorted(int(key) for key in entries)
+        if not x:
+            axes[0 if mode == "stale" else 1].set_visible(False)
+            continue
         for controller in ("ff", "gru"):
             axes[0 if mode == "stale" else 1].plot(
                 x, [entries[str(n)][controller]["success"] for n in x], marker="o", label=controller)
@@ -630,10 +742,10 @@ def _summary_markdown(result: dict[str, Any]) -> str:
              f"FF: existing two-layer action head; {result['architecture']['ff_parameters']} parameters. ",
              f"GRU: one layer, hidden {result['architecture']['gru_hidden']}, 256→64→5 action head; {result['architecture']['gru_parameter_audit']['registered']} registered, {result['architecture']['gru_parameter_audit']['trainable_requires_grad']} trainable/active parameters. The graph module retains its historical FF head in the state dict, frozen and bypassed by the GRU.",
              "Both use the unchanged 32-point no-local Surface Graph, existing 5D action, action clipping, IK and collision checks.", "",
-             f"Training: 800 base expert updates and 800 DAgger updates per seed for each controller family. GRU draws 16 ordered sequences/update (length at most {result['temporal']['sequence_length']}); DAgger draws 8 expert and 8 self-policy sequences. Hidden state starts at zero for each contiguous training segment and each episode, and persists through the full rollout. AdamW, LR 3e-4, weight decay 1e-4. FF checkpoints use the prior matched 800+800 protocol.", "",
+             f"Training: {result['temporal']['base_updates']} base expert updates and {result['temporal']['dagger_updates']} DAgger updates per seed for each controller. GRU draws {result['temporal']['sequence_batch_size']} ordered sequences/update (length at most {result['temporal']['sequence_length']}); DAgger mixes expert and self-policy sequences 1:1. Hidden state starts at zero for each contiguous training segment and each episode, and persists through the full rollout. Both controllers are trained from scratch under the canonical symmetric 100-edge topology. AdamW, LR 3e-4, weight decay 1e-4.", "",
              "The GRU has more trainable parameters. Both graph modules follow the historical seed initialization convention, but their learned graph weights are independently updated. Sequence draws and FF state draws have different numbers of supervised frames per update; the logged counts limit a strict capacity or sample-budget attribution.", "",
              "## Evaluation", "",
-             "Stale: the complete graph snapshot from immediately before the stale window is repeated while MuJoCo continues stepping. Delay: at step t the controller receives the complete graph from max(0,t−d). The full graph snapshot includes robot state and EE-local surface points. Perturbation: object/surface center shifts +0.025 m in world x at step 5. The task target and collision geoms update at the same step. Recovery time counts steps after the shift until position <0.025 m and yaw <0.200 rad; unrecovered episodes are censored at the horizon for the paired metric.", "",
+             "Stale: the complete graph snapshot from immediately before the stale window is repeated while MuJoCo continues stepping. Delay: at step t the controller receives the complete graph from max(0,t−d). The full graph snapshot includes robot state and EE-local surface points. Perturbation support shifts object/surface center +0.025 m in world x at step 5, but perturbation is reserved until stale/delay provide a reason to evaluate it.", "",
              "All corruption schedules and physical EpisodeSpecs are paired. Evaluation actions come only from the neural policy. Oracle actions are used during training collection, not closed-loop evaluation.", "",
              "## Results", "",
              "| Condition | Severity | FF success | GRU success | FF collision | GRU collision | Success Δ (GRU−FF) | Collision Δ |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
@@ -653,13 +765,17 @@ def _summary_markdown(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
+def run_experiment(output: Path = Path("artifacts/recurrent_feasibility_canonical100"), seeds: tuple[int, ...] = SEEDS,
                    device_preference: DevicePreference = "auto", eval_device_preference: DevicePreference = "auto",
-                   temporal: TemporalConfig = TemporalConfig(), eval_episodes: int = 16) -> dict[str, Any]:
+                   temporal: TemporalConfig = TemporalConfig(), eval_episodes: int = 16,
+                   smoke: bool = False, train_episodes: int | None = None,
+                   validation_episodes: int | None = None) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Experiment artifact already exists: {output}")
     root = ensure_dir(output)
     config = _task_config(root, seeds, device_preference, eval_device_preference, eval_episodes)
+    if not config.symmetric_robot_edges or config.point_count != 32:
+        raise AssertionError("New recurrent experiment must use the canonical 100-edge N=32 topology.")
     if config.max_steps > temporal.sequence_length:
         raise ValueError("This run requires full-episode sequences; increase sequence_length or add burn-in.")
     train_device = select_device(device_preference)
@@ -669,6 +785,9 @@ def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
     sf._write_json(root / "config.json", {"task": asdict(config), "temporal": asdict(temporal),
                                           "training_device": str(train_device), "evaluation_device": str(eval_device),
                                           "fixed_graph_variant": GRAPH_NAME, "surface_points": 32,
+                                          "topology": "consistent_intended_100", "local_surface_edges": False,
+                                          "smoke": smoke, "training_episode_limit": train_episodes,
+                                          "validation_episode_limit": validation_episodes,
                                           "eval_workers": 1, "sensor_to_command_latency": "NOT MEASURED"})
     aggregate: dict[str, Any] = {"seeds": seeds, "temporal": asdict(temporal), "per_seed": {}, "pooled": {},
                                  "latency": {}}
@@ -677,32 +796,35 @@ def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
     for seed in seeds:
         print(f"[recurrent] seed {seed}: loading paired expert data", flush=True)
         expert, val, train_specs, _ = final._current_datasets(seed, config)
-        prior_ff = PRIOR / "training" / f"seed{seed}" / GRAPH_NAME / "dagger_round1" / f"{GRAPH_NAME}.pt"
-        final._checkpoint_config_compatible(prior_ff, config, GRAPH_NAME, seed)
-        ff_base_training = json.loads((PRIOR / "training" / f"seed{seed}" / GRAPH_NAME / "base" /
-                                       f"{GRAPH_NAME}_training.json").read_text())
-        ff_dagger_training = json.loads((prior_ff.parent / "training.json").read_text())
-        if (ff_base_training["optimizer_updates"], ff_dagger_training["optimizer_updates"],
-            ff_base_training["batch_size"], ff_dagger_training["batch_size"]) != (800, 800, 128, 128):
-            raise ValueError("Historical FF checkpoint does not have the verified 800+800, batch-128 protocol.")
-        ff = sf.load_surface_model(prior_ff, GRAPH_NAME, config, eval_device)
-        # Match the historical FF base graph initialization convention.
-        # GRU/controller weights are created afterward from the same stream.
+        if train_episodes is not None:
+            train_specs = train_specs[:train_episodes]
+            expert = _restrict_episodes(expert, train_specs)
+        if validation_episodes is not None:
+            val_specs = sf.sample_episode_specs(config.validation_episodes, seed + 10_000, config, "validation")[:validation_episodes]
+            val = _restrict_episodes(val, val_specs)
+        seed_root = ensure_dir(root / "training" / f"seed{seed}")
+        sf._write_json(seed_root / "shared_train_episode_specs.json", [asdict(spec) for spec in train_specs])
+        ff_base = stab.train_fixed_updates(GRAPH_NAME, expert, val, config, seed,
+                                           seed_root / "ff_base", temporal.base_updates, device_preference)
+        ff_base_path = Path(ff_base["checkpoint_path"])
+        final._checkpoint_config_compatible(ff_base_path, config, GRAPH_NAME, seed)
+        ff_base_model = sf.load_surface_model(ff_base_path, GRAPH_NAME, config, eval_device)
+        ff_policy, ff_metadata, ff_collection = final.collect_self_policy_states(
+            GRAPH_NAME, ff_base_model, train_specs, _expert_reference(seed, train_specs),
+            config, seed, eval_device, root / "onpolicy_collection" / f"seed{seed}" / "ff")
+        ff_dagger = final.train_dagger_round1(
+            GRAPH_NAME, ff_base_path, expert, val, ff_policy, ff_metadata,
+            config, seed, train_device, seed_root / "ff_dagger_round1", updates=temporal.dagger_updates)
+        ff_checkpoint = Path(ff_dagger["checkpoint_path"])
+        final._checkpoint_config_compatible(ff_checkpoint, config, GRAPH_NAME, seed)
+        ff = sf.load_surface_model(ff_checkpoint, GRAPH_NAME, config, eval_device)
         set_seed(seed)
         gru = GraphGRUPolicy(config, temporal.gru_hidden).to(train_device)
-        seed_root = ensure_dir(root / "training" / f"seed{seed}")
-        sf._write_json(seed_root / "ff_reused_checkpoint.json", {"checkpoint": str(prior_ff),
-                                                            "protocol": "800 base + 800 self-policy DAgger updates",
-                                                            "parameter_count": sf.model_parameter_count(ff),
-                                                            "graph_initialization_seed": seed,
-                                                            "expert_valid_supervised_draws": 800 * 128 + ff_dagger_training["effective_expert_draws"],
-                                                            "policy_valid_supervised_draws": ff_dagger_training["effective_policy_draws"],
-                                                            "total_valid_supervised_draws": 800 * 128 + ff_dagger_training["effective_expert_draws"] + ff_dagger_training["effective_policy_draws"]})
         base = train_gru(gru, expert, val, None, config, temporal, seed, train_device,
                          temporal.base_updates, seed_root / "gru_base")
         gru = _load_gru(Path(base["checkpoint"]), config, temporal, eval_device)
         policy_data, collection = collect_recurrent_policy_data(
-            gru, train_specs, config, temporal, seed, eval_device, root / "onpolicy_collection" / f"seed{seed}")
+            gru, train_specs, config, temporal, seed, eval_device, root / "onpolicy_collection" / f"seed{seed}" / "gru")
         gru = gru.to(train_device)
         dagger = train_gru(gru, expert, val, policy_data, config, temporal, seed, train_device,
                            temporal.dagger_updates, seed_root / "gru_dagger_round1")
@@ -713,11 +835,14 @@ def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
         rows = condition.pop("rows")
         for name in rows:
             pooled_rows[("fresh", 0)][name].extend(rows[name])
-        aggregate["per_seed"][str(seed)] = {"base_training": base, "dagger_training": dagger,
-                                            "onpolicy_collection": collection,
+        aggregate["per_seed"][str(seed)] = {"ff_base_training": ff_base, "ff_dagger_training": ff_dagger,
+                                            "ff_onpolicy_collection": ff_collection,
+                                            "gru_base_training": base, "gru_dagger_training": dagger,
+                                            "gru_onpolicy_collection": collection,
+                                            "training_episode_count": len(train_specs),
                                             "conditions": {"fresh": {"0": condition}}}
         print(f"[recurrent] seed {seed}: fresh FF={condition['ff']['success']:.3f}, GRU={condition['gru']['success']:.3f}, collision FF={condition['ff']['collision']:.3f}, GRU={condition['gru']['collision']:.3f}", flush=True)
-        checkpoint_map[seed] = (prior_ff, Path(dagger["checkpoint"]))
+        checkpoint_map[seed] = (ff_checkpoint, Path(dagger["checkpoint"]))
         del ff, gru
     fresh_rows = pooled_rows[("fresh", 0)]
     fresh_ff, fresh_gru = _metric_means(fresh_rows["ff"]), _metric_means(fresh_rows["gru"])
@@ -730,14 +855,15 @@ def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
     gate_passed = all(gate_checks.values())
     aggregate["fresh_gate_checks"] = gate_checks
     print(f"[recurrent] pooled fresh gate: {gate_checks}", flush=True)
-    if gate_passed:
+    if gate_passed or smoke:
         for seed in seeds:
             ff_checkpoint, gru_checkpoint = checkpoint_map[seed]
             ff = sf.load_surface_model(ff_checkpoint, GRAPH_NAME, config, eval_device)
             gru = _load_gru(gru_checkpoint, config, temporal, eval_device)
             specs = sf.sample_episode_specs(config.eval_episodes, seed + 60_000, config, "iid")[:eval_episodes]
-            for mode, levels in (("stale", temporal.stale_lengths), ("delay", temporal.delay_lengths),
-                                 ("perturbation", (0,))):
+            conditions = (("stale", (1,)),) if smoke else (("stale", temporal.stale_lengths),
+                                                           ("delay", temporal.delay_lengths))
+            for mode, levels in conditions:
                 aggregate["per_seed"][str(seed)]["conditions"][mode] = {}
                 for severity in levels:
                     if mode in ("stale", "delay") and severity == 0:
@@ -784,7 +910,7 @@ def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
         if not gate_passed else
         "Fresh-observation behavior was established. Inspect paired confidence intervals and degradation curves before attributing differences to temporal memory; the GRU has substantially more parameters."
     )
-    if gate_passed:
+    if gate_passed or smoke:
         _plot_condition_curves(aggregate, root / "plots" / "degradation_success.png")
     sf._write_json(root / "summary.json", aggregate)
     (root / "summary.md").write_text(_summary_markdown(aggregate), encoding="utf-8")
@@ -793,7 +919,7 @@ def run_experiment(output: Path = ROOT, seeds: tuple[int, ...] = SEEDS,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=ROOT)
+    parser.add_argument("--output", type=Path, default=Path("artifacts/recurrent_feasibility_canonical100"))
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--eval-device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--eval-workers", type=int, default=1)
@@ -803,13 +929,17 @@ def main() -> None:
     parser.add_argument("--dagger-updates", type=int, default=800)
     parser.add_argument("--latency-warmup", type=int, default=200)
     parser.add_argument("--latency-iterations", type=int, default=2000)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--train-episodes", type=int)
+    parser.add_argument("--validation-episodes", type=int)
     args = parser.parse_args()
     if args.eval_workers != 1:
         parser.error("Episode workers are currently serial; each MuJoCo environment remains process-local.")
     temporal = replace(TemporalConfig(), base_updates=args.base_updates,
                        dagger_updates=args.dagger_updates, latency_warmup=args.latency_warmup,
                        latency_iterations=args.latency_iterations)
-    run_experiment(args.output, tuple(args.seeds), args.device, args.eval_device, temporal, args.eval_episodes)
+    run_experiment(args.output, tuple(args.seeds), args.device, args.eval_device, temporal, args.eval_episodes,
+                   args.smoke, args.train_episodes, args.validation_episodes)
 
 
 if __name__ == "__main__":

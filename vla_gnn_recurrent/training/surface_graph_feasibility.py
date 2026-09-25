@@ -58,6 +58,8 @@ class SurfaceFeasibilityConfig:
     graph_k: int = GRAPH_K
     graph_radius: float = GRAPH_RADIUS
     point_count: int = SURFACE_POINTS
+    # Opt in only for new canonical runs; historical checkpoints retain their 98-edge training protocol.
+    symmetric_robot_edges: bool = False
     max_delta_ee: float = 0.035
     max_delta_rotation: float = 0.35
     max_delta_gripper: float = 0.25
@@ -541,9 +543,12 @@ def _torch_topology(points: torch.Tensor, state: torch.Tensor, config: SurfaceFe
     src_parts = [torch.cat([ee_src, surf_dst], dim=1)]
     dst_parts = [torch.cat([surf_dst, ee_src], dim=1)]
     type_parts = [torch.ones((batch, count * 2), dtype=torch.long, device=device)]
-    src_parts.append(torch.stack([torch.zeros(batch, dtype=torch.long, device=device), torch.ones(batch, dtype=torch.long, device=device)], dim=-1))
-    dst_parts.append(torch.stack([torch.ones(batch, dtype=torch.long, device=device), torch.zeros(batch, dtype=torch.long, device=device)], dim=-1))
-    type_parts.append(torch.zeros((batch, 2), dtype=torch.long, device=device))
+    robot_tips = (1, 2) if config.symmetric_robot_edges else (1,)
+    robot_src = torch.as_tensor([node for tip in robot_tips for node in (0, tip)], device=device)
+    robot_dst = torch.as_tensor([node for tip in robot_tips for node in (tip, 0)], device=device)
+    src_parts.append(robot_src.expand(batch, -1))
+    dst_parts.append(robot_dst.expand(batch, -1))
+    type_parts.append(torch.zeros((batch, len(robot_src)), dtype=torch.long, device=device))
 
     tip_src = tip_to_surface_src.reshape(batch, -1)
     tip_dst = tip_to_surface_dst.reshape(batch, -1)
@@ -559,11 +564,15 @@ def _torch_topology(points: torch.Tensor, state: torch.Tensor, config: SurfaceFe
         ss_types = torch.full((batch, ss_src.numel() // batch * 2), 3, dtype=torch.long, device=device)
         type_parts.append(ss_types)
         valid_parts.append(torch.cat([ss_valid.reshape(batch, -1), ss_valid.reshape(batch, -1)], dim=1))
-    return GraphTopology(
+    topology = GraphTopology(
         src=torch.cat(src_parts, dim=1), dst=torch.cat(dst_parts, dim=1),
         edge_type=torch.cat(type_parts, dim=1), valid=torch.cat(valid_parts, dim=1),
         surface_pairs=torch.stack([ss_src.reshape(batch, -1), ss_dst.reshape(batch, -1)], dim=-1),
     )
+    if config.symmetric_robot_edges and not use_local_edges:
+        if count != SURFACE_POINTS or topology.src.shape[1] != 100 or torch.any(topology.edge_type == 3):
+            raise AssertionError("Canonical no-local graph requires 32 points and 100 directed edges.")
+    return topology
 
 
 def build_graph_topology_numpy(points: np.ndarray, tips: np.ndarray, config: SurfaceFeasibilityConfig,
@@ -600,9 +609,13 @@ def build_graph_topology_numpy(points: np.ndarray, tips: np.ndarray, config: Sur
             src.extend([int(a) + 3, int(b) + 3]); dst.extend([int(b) + 3, int(a) + 3]); types.extend([3, 3]); valid.extend([True, True])
     else:
         pairs = np.empty((0, 2), dtype=np.int64)
-    return {"src": np.asarray(src, dtype=np.int64), "dst": np.asarray(dst, dtype=np.int64),
-            "edge_type": np.asarray(types, dtype=np.int64), "valid": np.asarray(valid, dtype=bool),
-            "surface_pairs": np.asarray(pairs, dtype=np.int64)}
+    topology = {"src": np.asarray(src, dtype=np.int64), "dst": np.asarray(dst, dtype=np.int64),
+                "edge_type": np.asarray(types, dtype=np.int64), "valid": np.asarray(valid, dtype=bool),
+                "surface_pairs": np.asarray(pairs, dtype=np.int64)}
+    if config.symmetric_robot_edges and not use_local_edges:
+        if count != SURFACE_POINTS or len(topology["src"]) != 100 or np.any(topology["edge_type"] == 3):
+            raise AssertionError("Canonical no-local graph requires 32 points and 100 directed edges.")
+    return topology
 
 
 def cached_topology_valid(cached_identity: str | None, current_identity: str | None) -> bool:

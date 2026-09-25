@@ -96,7 +96,7 @@ def test_masked_target_has_no_supervised_gradient() -> None:
     assert torch.any(prediction.grad[0, 2] != 0)
 
 
-def test_spatial_topology_parity_in_each_phase_without_repairing_legacy_difference(monkeypatch) -> None:
+def test_historical_spatial_topology_remains_available_for_provenance(monkeypatch) -> None:
     config = sf.SurfaceFeasibilityConfig()
     set_seed(2811)
     ff = sf.build_surface_model("surface_graph_no_local", config).eval()
@@ -139,6 +139,62 @@ def test_spatial_topology_parity_in_each_phase_without_repairing_legacy_differen
     for key in ("src", "dst", "edge_type", "valid"):
         assert np.array_equal(inference_topologies[0][key], inference_topologies[1][key])
     assert not np.any(inference_topologies[0]["edge_type"] == 3)
+
+
+def test_canonical_100_edge_topology_in_ff_and_gru_training_and_rollout(monkeypatch) -> None:
+    from dataclasses import replace
+
+    config = replace(sf.SurfaceFeasibilityConfig(), symmetric_robot_edges=True)
+    assert config.point_count == 32
+    state = torch.zeros(1, sf.STATE_DIM)
+    points = torch.zeros(1, sf.SURFACE_POINTS, 3)
+    ff = sf.build_surface_model(rf.GRAPH_NAME, config).eval()
+    gru = rf.GraphGRUPolicy(config).eval()
+    train_topologies = []
+    original = sf._torch_topology
+
+    def watch(*args, **kwargs):
+        topology = original(*args, **kwargs)
+        train_topologies.append(topology)
+        return topology
+
+    monkeypatch.setattr(sf, "_torch_topology", watch)
+    with torch.no_grad():
+        ff(state, points)
+        gru.forward_sequence(state[:, None], points[:, None])
+    assert len(train_topologies) == 2
+    for topology in train_topologies:
+        rf.assert_canonical_topology(topology, config)
+    assert torch.equal(train_topologies[0].src, train_topologies[1].src)
+    assert torch.equal(train_topologies[0].dst, train_topologies[1].dst)
+    for model, name in ((ff, "ff"), (gru, "gru")):
+        state_t, points_t, rollout_topology = rf._graph_tensors(state[0].numpy(), points[0].numpy(),
+                                                                config, torch.device("cpu"))
+        rf.assert_canonical_topology(rollout_topology, config)
+        rf.controller_step(model, name, state_t[0].numpy(), points_t[0].numpy(), None,
+                           config, torch.device("cpu"))
+    assert {(0, 1), (1, 0), (0, 2), (2, 0)}.issubset(
+        set(zip(train_topologies[0].src[0].tolist(), train_topologies[0].dst[0].tolist(), strict=True)))
+
+
+def test_canonical_gru_training_sequence_matches_stepwise_rollout() -> None:
+    from dataclasses import replace
+
+    config = replace(sf.SurfaceFeasibilityConfig(), symmetric_robot_edges=True)
+    generator = torch.Generator().manual_seed(2811)
+    states = torch.randn(1, 6, sf.STATE_DIM, generator=generator) * 0.1
+    points = torch.randn(1, 6, sf.SURFACE_POINTS, 3, generator=generator) * 0.03
+    model = rf.GraphGRUPolicy(config).eval()
+    with torch.no_grad():
+        sequence_actions, _ = model.forward_sequence(states, points)
+        hidden = None
+        step_actions = []
+        for t in range(states.shape[1]):
+            state_t, points_t, topology = rf._graph_tensors(
+                states[0, t].numpy(), points[0, t].numpy(), config, torch.device("cpu"))
+            action, hidden = model.step(state_t, points_t, hidden, topology)
+            step_actions.append(action)
+    assert torch.allclose(sequence_actions, torch.stack(step_actions, dim=1), atol=1e-6)
 
 
 def test_registered_trainable_and_active_parameter_counts() -> None:
